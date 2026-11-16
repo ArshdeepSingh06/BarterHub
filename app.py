@@ -3,29 +3,20 @@ import sqlite3
 
 import streamlit as st
 
-DATABASE = "barterhub.db"
+from auth import auth_page, connect_db, setup_auth_database
 
-
-def connect_db():
-    return sqlite3.connect(DATABASE)
-
+# ───────────── DATABASE ─────────────
 
 def setup_database():
-    with connect_db() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS listings (
+    setup_auth_database()
+    with connect_db() as db:
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS listings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL,
-                category TEXT NOT NULL,
-                offered TEXT NOT NULL,
-                wanted TEXT NOT NULL,
-                user_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL DEFAULT ''
-            )
-            """
+                title TEXT NOT NULL, description TEXT NOT NULL,
+                offered TEXT NOT NULL, wanted TEXT NOT NULL,
+                user_id INTEGER, status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"""
         )
 
         existing_columns = {
@@ -52,17 +43,9 @@ def setup_database():
         )
 
 
-def save_listing(title, description, category, offered, wanted):
-    with connect_db() as connection:
-        connection.execute(
-            """
-            INSERT INTO listings
-                (title, description, category, offered, wanted,
-                 user_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?, NULL, 'active', CURRENT_TIMESTAMP)
-            """,
-            (title, description, category, offered, wanted),
-        )
+def query(sql, params=()):
+    with connect_db() as db:
+        return db.execute(sql, params).fetchall()
 
 
 def find_listings(search_text="", category_filter="All", sort_order="Newest first"):
