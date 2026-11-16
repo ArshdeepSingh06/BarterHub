@@ -1,4 +1,5 @@
 import html
+import sqlite3
 
 import streamlit as st
 
@@ -17,13 +18,28 @@ def setup_database():
                 user_id INTEGER, status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"""
         )
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS offers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                listing_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-                message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE (listing_id, user_id))"""
+
+        existing_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(listings)")
+        }
+        needed_columns = {
+            "user_id": "INTEGER",
+            "status": "TEXT NOT NULL DEFAULT 'active'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        }
+
+        for column, definition in needed_columns.items():
+            if column not in existing_columns:
+                connection.execute(
+                    f"ALTER TABLE listings ADD COLUMN {column} {definition}"
+                )
+
+        connection.execute(
+            """
+            UPDATE listings
+            SET created_at = CURRENT_TIMESTAMP
+            WHERE created_at = ''
+            """
         )
 
 
@@ -32,234 +48,276 @@ def query(sql, params=()):
         return db.execute(sql, params).fetchall()
 
 
-def run(sql, params=()):
-    with connect_db() as db:
-        return db.execute(sql, params).rowcount
+def find_listings(search_text="", category_filter="All", sort_order="Newest first"):
+    pattern = f"%{search_text}%"
+    sort_direction = "ASC" if sort_order == "Oldest first" else "DESC"
+
+    with connect_db() as connection:
+        return connection.execute(
+            f"""
+            SELECT id, title, description, category, offered, wanted, created_at
+            FROM listings
+            WHERE status = 'active'
+              AND (? = 'All' OR category = ?)
+              AND (
+                  title LIKE ?
+                  OR description LIKE ?
+                  OR category LIKE ?
+                  OR offered LIKE ?
+                  OR wanted LIKE ?
+              )
+            ORDER BY id {sort_direction}
+            """,
+            (
+                category_filter,
+                category_filter,
+                pattern,
+                pattern,
+                pattern,
+                pattern,
+                pattern,
+            ),
+        ).fetchall()
 
 
-LISTING = """SELECT l.id, l.title, l.description, l.offered, l.wanted,
-                    l.created_at, u.name
-             FROM listings l LEFT JOIN users u ON l.user_id = u.id"""
+def show_listing_card(listing, animation=""):
+    _, title, description, category, offered, wanted, created_at = listing
 
+    safe_title = html.escape(title)
+    safe_description = html.escape(description)
+    safe_category = html.escape(category)
+    safe_offered = html.escape(offered)
+    safe_wanted = html.escape(wanted)
+    safe_created_at = html.escape(created_at)
 
-def find_listings(user_id, text=""):
-    return query(
-        LISTING
-        + """ WHERE l.status = 'active' AND l.user_id != ?
-              AND instr(lower(l.title || ' ' || l.description
-                              || ' ' || l.offered || ' ' || l.wanted), lower(?)) > 0
-              AND NOT EXISTS (SELECT 1 FROM offers o
-                              WHERE o.listing_id = l.id AND o.user_id = ?)
-              ORDER BY l.id DESC""",
-        (user_id, text, user_id),
-    )
-
-
-def my_listings(user_id):
-    return query(LISTING + " WHERE l.user_id = ? AND l.status = 'active' ORDER BY l.id DESC", (user_id,))
-
-
-def my_offers(user_id):
-    return query(
-        """SELECT o.id, l.title, o.message, o.status, u.name, u.email
-           FROM offers o JOIN listings l ON o.listing_id = l.id
-           LEFT JOIN users u ON l.user_id = u.id
-           WHERE o.user_id = ? ORDER BY o.id DESC""",
-        (user_id,),
-    )
-
-
-def incoming_offers(user_id):
-    return query(
-        """SELECT o.id, l.title, o.message, o.status, u.name, u.email
-           FROM offers o JOIN listings l ON o.listing_id = l.id
-           JOIN users u ON o.user_id = u.id
-           WHERE l.user_id = ? ORDER BY (o.status = 'pending') DESC, o.id DESC""",
-        (user_id,),
-    )
-
-
-# ───────────── BARTER ACTIONS (button callbacks) ─────────────
-
-def propose(listing_id):
-    message = st.session_state.get(f"offer_{listing_id}", "").strip()
-    if not message:
-        st.toast("Describe what you would trade first.", icon="⚠️")
-        return
-    saved = run(
-        """INSERT OR IGNORE INTO offers (listing_id, user_id, message)
-           SELECT id, ?, ? FROM listings
-           WHERE id = ? AND status = 'active' AND user_id != ?""",
-        (st.session_state.user_id, message, listing_id, st.session_state.user_id),
-    )
-    st.toast("Barter proposed!" if saved else "That listing is no longer available.", icon="🔄")
-    st.session_state.card_animation = "from-left"
-
-
-def skip(listing_id):
-    st.session_state.dismissed.add(listing_id)
-    st.session_state.card_animation = "from-right"
-
-
-def withdraw(offer_id):
-    run("DELETE FROM offers WHERE id = ? AND user_id = ? AND status = 'pending'",
-        (offer_id, st.session_state.user_id))
-
-
-def respond(offer_id, accept):
-    with connect_db() as db:
-        row = db.execute(
-            """SELECT o.listing_id FROM offers o JOIN listings l ON o.listing_id = l.id
-               WHERE o.id = ? AND l.user_id = ? AND o.status = 'pending'
-                 AND l.status = 'active'""",
-            (offer_id, st.session_state.user_id),
-        ).fetchone()
-        if not row:
-            return
-        db.execute("UPDATE offers SET status = ? WHERE id = ?",
-                   ("accepted" if accept else "declined", offer_id))
-        if accept:
-            db.execute("UPDATE listings SET status = 'traded' WHERE id = ?", row)
-            db.execute("UPDATE offers SET status = 'declined' WHERE listing_id = ? AND status = 'pending'", row)
-
-
-def remove_listing(listing_id):
-    with connect_db() as db:
-        if db.execute("UPDATE listings SET status = 'removed' WHERE id = ? AND user_id = ? AND status = 'active'",
-                      (listing_id, st.session_state.user_id)).rowcount:
-            db.execute("UPDATE offers SET status = 'declined' WHERE listing_id = ? AND status = 'pending'", (listing_id,))
-
-
-def logout():
-    st.session_state.clear()
-
-
-# ───────────── UI HELPERS ─────────────
-
-def card(listing, animation=""):
-    _, title, desc, offered, wanted, created, owner = (html.escape(str(v or "")) for v in listing)
     st.markdown(
-        f"""<div class="listing-card {animation}">
-        <h2>{title}</h2><p>{desc}</p>
-        <div class="listing-detail"><strong>Offering</strong><br>{offered}</div>
-        <div class="listing-detail"><strong>Looking for</strong><br>{wanted}</div>
-        <div class="listing-date">Posted by <strong>{owner or "Unknown"}</strong> on {created[:10]}</div>
-        </div>""",
+        f"""
+        <div class="listing-card {animation}">
+            <div class="listing-category">{safe_category}</div>
+            <h2>{safe_title}</h2>
+            <p>{safe_description}</p>
+            <div class="listing-detail">
+                <strong>Offering</strong><br>{safe_offered}
+            </div>
+            <div class="listing-detail">
+                <strong>Looking for</strong><br>{safe_wanted}
+            </div>
+            <div class="listing-date">Posted {safe_created_at}</div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
 
-BADGE = {"pending": "⏳ Pending", "accepted": "✅ Accepted", "declined": "❌ Declined"}
-
-CSS = """<style>
-.listing-card{max-width:680px;margin:12px auto 20px;padding:28px;border:1px solid #d9e2ec;
- border-radius:18px;background:white;color:#14213d;box-shadow:0 8px 24px rgba(20,40,60,.10)}
-.listing-card h2{margin:8px 0 12px;color:#14213d}.listing-card p{color:#14213d}
-.listing-detail{margin-top:14px;padding:12px 14px;border-radius:10px;background:#f4f7fa;color:#14213d;line-height:1.6}
-.listing-date{margin-top:16px;color:#667085;font-size:.8rem}.listing-date strong{color:#14213d}
-@keyframes inL{from{opacity:0;transform:translateX(-90px) rotate(-3deg)}to{opacity:1;transform:none}}
-@keyframes inR{from{opacity:0;transform:translateX(90px) rotate(3deg)}to{opacity:1;transform:none}}
-.from-left{animation:inL .35s ease-out}.from-right{animation:inR .35s ease-out}
-</style>"""
-
-
-# ───────────── PAGE ─────────────
-
 st.set_page_config(page_title="BarterHub", page_icon="🔄")
 setup_database()
 
-if not st.session_state.get("logged_in"):
-    auth_page()
-    st.stop()
+st.markdown(
+    """
+    <style>
+    .listing-card {
+        max-width: 680px;
+        margin: 12px auto 20px auto;
+        padding: 28px;
+        border: 1px solid #d9e2ec;
+        border-radius: 18px;
+        background: white;
+        box-shadow: 0 8px 24px rgba(20, 40, 60, 0.10);
+    }
 
-uid = st.session_state.user_id
-st.session_state.setdefault("dismissed", set())
-st.session_state.setdefault("card_animation", "")
-st.markdown(CSS, unsafe_allow_html=True)
+    .listing-card h2 {
+        margin: 8px 0 12px 0;
+        color: #14213d;
+    }
 
-head, out = st.columns([5, 1])
-head.title("🔄 BarterHub")
-head.write(f"Hi {st.session_state.user_name}! Swap items and services with your community.")
-out.write("")
-out.write("")
-out.button("Logout", on_click=logout)
+    .listing-category {
+        color: #167d69;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        font-size: 0.8rem;
+    }
 
-discover_tab, offers_tab, sell_tab = st.tabs(["🔎 Discover", "🔄 My Offers", "＋ Sell"])
+    .listing-detail {
+        margin-top: 14px;
+        padding: 12px 14px;
+        border-radius: 10px;
+        background: #f4f7fa;
+        line-height: 1.6;
+    }
 
-# ── Discover ──
+    .listing-date {
+        margin-top: 16px;
+        color: #667085;
+        font-size: 0.8rem;
+    }
+
+    @keyframes enterFromLeft {
+        from { opacity: 0; transform: translateX(-90px) rotate(-3deg); }
+        to   { opacity: 1; transform: translateX(0) rotate(0); }
+    }
+
+    @keyframes enterFromRight {
+        from { opacity: 0; transform: translateX(90px) rotate(3deg); }
+        to   { opacity: 1; transform: translateX(0) rotate(0); }
+    }
+
+    .from-left {
+        animation: enterFromLeft 0.35s ease-out;
+    }
+
+    .from-right {
+        animation: enterFromRight 0.35s ease-out;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("🔄 BarterHub")
+st.write("Discover useful things and exchange items or services with your community.")
+
+if "buy_listings" not in st.session_state:
+    st.session_state.buy_listings = set()
+
+if "dismissed_listings" not in st.session_state:
+    st.session_state.dismissed_listings = set()
+
+if "card_animation" not in st.session_state:
+    st.session_state.card_animation = ""
+
+discover_tab, buy_tab, sell_tab = st.tabs(["🔎 Discover", "🛒 Buy", "＋ Sell"])
+
 with discover_tab:
     st.subheader("Discover listings")
-    text = st.text_input("Search BarterHub", placeholder="Search items, services, or what people want").strip()
 
-    queue = [l for l in find_listings(uid, text) if l[0] not in st.session_state.dismissed]
-    if queue:
-        current = queue[0]
-        card(current, st.session_state.card_animation)
+    search_text = st.text_input(
+        "Search BarterHub",
+        placeholder="Search items, services, or what people want",
+        key="discover_search",
+    )
+
+    filter_col, sort_col = st.columns(2)
+
+    with filter_col:
+        category_filter = st.selectbox(
+            "Category",
+            ["All", "Books", "Electronics", "Home", "Services", "Other"],
+        )
+
+    with sort_col:
+        sort_order = st.selectbox(
+            "Sort by",
+            ["Newest first", "Oldest first"],
+        )
+
+    listings = find_listings(
+        search_text.strip(),
+        category_filter,
+        sort_order,
+    )
+
+    unseen_listings = [
+        listing
+        for listing in listings
+        if listing[0] not in st.session_state.buy_listings
+        and listing[0] not in st.session_state.dismissed_listings
+    ]
+
+    if unseen_listings:
+        current_listing = unseen_listings[0]
+        listing_id = current_listing[0]
+
+        show_listing_card(current_listing, st.session_state.card_animation)
         st.session_state.card_animation = ""
-        st.text_input("What will you trade for this?", placeholder=f"e.g. {current[4]}", key=f"offer_{current[0]}")
-        a, b = st.columns(2)
-        a.button("🔄 Propose barter", key=f"yes_{current[0]}", on_click=propose, args=(current[0],), use_container_width=True)
-        b.button("✕ Skip", key=f"no_{current[0]}", on_click=skip, args=(current[0],), use_container_width=True)
-        st.caption(f"{len(queue)} listing(s) left to discover.")
+
+        interested_col, skip_col = st.columns(2)
+
+        with interested_col:
+            if st.button(
+                "🛒 Interested",
+                key=f"interested_{listing_id}",
+                use_container_width=True,
+            ):
+                st.session_state.buy_listings.add(listing_id)
+                st.session_state.card_animation = "from-left"
+                st.rerun()
+
+        with skip_col:
+            if st.button(
+                "✕ Not interested",
+                key=f"skip_{listing_id}",
+                use_container_width=True,
+            ):
+                st.session_state.dismissed_listings.add(listing_id)
+                st.session_state.card_animation = "from-right"
+                st.rerun()
+
+        st.caption(f"{len(unseen_listings)} listing(s) left to discover.")
     else:
-        st.info("You’ve reached the end of these listings. Try another search.")
+        st.info("You’ve reached the end of these listings. Try another search or category.")
 
-# ── My Offers (as buyer) ──
-with offers_tab:
-    st.subheader("Barters you proposed")
-    st.caption("No payment is made here. Contact details appear once the owner accepts.")
-    mine = my_offers(uid)
-    for oid, title, message, status, owner, email in mine:
-        with st.container(border=True):
-            st.markdown(f"**{title}** — {BADGE[status]}")
-            st.write(f"You offered: {message}")
-            if status == "accepted":
-                st.success(f"Deal! Contact {owner} at {email} to arrange the swap.")
-            elif status == "pending":
-                st.button("Withdraw", key=f"w_{oid}", on_click=withdraw, args=(oid,))
-    if not mine:
-        st.info("Barters you propose in Discover will appear here.")
+with buy_tab:
+    st.subheader("Your interested list")
+    st.caption("These are listings you may want to barter for. No payment is made here.")
 
-# ── Sell ──
+    all_listings = find_listings()
+    interested_listings = [
+        listing for listing in all_listings
+        if listing[0] in st.session_state.buy_listings
+    ]
+
+    if interested_listings:
+        for listing in interested_listings:
+            listing_id = listing[0]
+            show_listing_card(listing)
+
+            if st.button(
+                "Remove from list",
+                key=f"remove_{listing_id}",
+            ):
+                st.session_state.buy_listings.remove(listing_id)
+                st.rerun()
+    else:
+        st.info("Listings you mark as Interested will appear here.")
+
 with sell_tab:
     st.subheader("Post a listing")
+
     with st.form("listing_form", clear_on_submit=True):
-        title = st.text_input("Name of item or service", placeholder="e.g. Intro to Python tutoring")
-        description = st.text_area("Relevant information", placeholder="Describe the item or service, its condition, or useful details.")
-        offered = st.text_input("What are you offering?", placeholder="e.g. Python tutoring")
-        wanted = st.text_input("What would you like in exchange?", placeholder="e.g. a statistics textbook")
+        title = st.text_input(
+            "Name of item or service",
+            placeholder="e.g. Intro to Python tutoring",
+        )
+        description = st.text_area(
+            "Relevant information",
+            placeholder="Describe the item or service, its condition, or useful details.",
+        )
+        category = st.selectbox(
+            "Category",
+            ["Books", "Electronics", "Home", "Services", "Other"],
+            key="sell_category",
+        )
+        offered = st.text_input(
+            "What are you offering?",
+            placeholder="e.g. Python tutoring",
+        )
+        wanted = st.text_input(
+            "What would you like in exchange?",
+            placeholder="e.g. a statistics textbook",
+        )
         submitted = st.form_submit_button("Post listing")
 
     if submitted:
-        values = [v.strip() for v in (title, description, offered, wanted)]
-        if all(values):
-            t, d, o, w = values
-            run("INSERT INTO listings (title, description, offered, wanted, user_id) VALUES (?, ?, ?, ?, ?)",
-                (t, d, o, w, uid))
+        if all(value.strip() for value in (title, description, offered, wanted)):
+            save_listing(
+                title.strip(),
+                description.strip(),
+                category,
+                offered.strip(),
+                wanted.strip(),
+            )
             st.success("Your listing is now available in Discover.")
+            st.rerun()
         else:
             st.error("Fill in the item name, information, offer, and what you want.")
-
-    st.subheader("Requests on your listings")
-    requests = incoming_offers(uid)
-    for oid, title, message, status, name, email in requests:
-        with st.container(border=True):
-            st.markdown(f"**{title}** — {BADGE[status]}")
-            st.write(f"{name} offers: {message}")
-            if status == "pending":
-                x, y = st.columns(2)
-                x.button("Accept", key=f"a_{oid}", on_click=respond, args=(oid, True), use_container_width=True)
-                y.button("Decline", key=f"d_{oid}", on_click=respond, args=(oid, False), use_container_width=True)
-            elif status == "accepted":
-                st.success(f"Deal! Contact {name} at {email} to arrange the swap.")
-    if not requests:
-        st.caption("No requests yet.")
-
-    st.subheader("Your active listings")
-    active = my_listings(uid)
-    for listing in active:
-        with st.container(border=True):
-            st.markdown(f"**{listing[1]}**  \nOffering {listing[3]} → wants {listing[4]}")
-            st.button("Remove", key=f"rm_{listing[0]}", on_click=remove_listing, args=(listing[0],))
-    if not active:
-        st.caption("You have no active listings.")
